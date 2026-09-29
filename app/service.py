@@ -1,27 +1,14 @@
+import json
 import os
 import re
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify, render_template_string
-
-app = Flask(__name__)
-
-# 讀取環境變數
-REPORTER_TOKEN = os.environ.get("REPORTER_TOKEN", "")
-OPERATOR_TOKEN = os.environ.get("OPERATOR_TOKEN", "")
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 記憶體存儲
 events_store = {}
 
 def get_tokens():
-    rep = os.environ.get("REPORTER_TOKEN", REPORTER_TOKEN)
-    op = os.environ.get("OPERATOR_TOKEN", OPERATOR_TOKEN)
-    return rep, op
-
-def get_bearer_token():
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:].strip()
-    return None
+    return os.environ.get("REPORTER_TOKEN", ""), os.environ.get("OPERATOR_TOKEN", "")
 
 def validate_iso8601_with_tz(date_str):
     try:
@@ -30,105 +17,7 @@ def validate_iso8601_with_tz(date_str):
     except Exception:
         return False
 
-@app.route("/health", methods=["GET"])
-def health():
-    version = os.environ.get("APP_VERSION", "unknown")
-    rep, op = get_tokens()
-    auth_configured = bool(rep and op)
-    return jsonify({
-        "status": "ok",
-        "service": "inspection",
-        "version": version,
-        "auth_configured": auth_configured
-    }), 200
-
-@app.route("/events", methods=["POST"])
-def post_event():
-    rep_token, op_token = get_tokens()
-    token = get_bearer_token()
-
-    # 1. 認證優先 (401)
-    if not token or (token != rep_token and token != op_token):
-        return jsonify({"error": "Unauthorized"}), 401
-    # 2. 授權 (403)
-    if token != rep_token:
-        return jsonify({"error": "Forbidden"}), 403
-
-    # 3. 請求大小與格式驗證 (400)
-    if request.content_length and request.content_length > 4096:
-        return jsonify({"error": "Payload too large", "field": "body"}), 400
-    if not request.is_json:
-        return jsonify({"error": "Content-Type must be application/json", "field": "Content-Type"}), 400
-
-    data = request.get_json(silent=True)
-    if data is None or not isinstance(data, dict):
-        return jsonify({"error": "Invalid JSON body", "field": "body"}), 400
-
-    allowed_keys = {"event_id", "device_id", "observed_at", "type", "note"}
-    if not set(data.keys()).issubset(allowed_keys):
-        extra = list(set(data.keys()) - allowed_keys)[0]
-        return jsonify({"error": "Extra field not allowed", "field": extra}), 400
-
-    for req_field in ["event_id", "device_id", "observed_at", "type"]:
-        if req_field not in data:
-            return jsonify({"error": "Missing required field", "field": req_field}), 400
-
-    if not (isinstance(data["event_id"], str) and 1 <= len(data["event_id"]) <= 64 and re.fullmatch(r"[A-Za-z0-9_-]+", data["event_id"])):
-        return jsonify({"error": "Invalid event_id", "field": "event_id"}), 400
-
-    if not (isinstance(data["device_id"], str) and 1 <= len(data["device_id"]) <= 32 and re.fullmatch(r"[A-Za-z0-9_-]+", data["device_id"])):
-        return jsonify({"error": "Invalid device_id", "field": "device_id"}), 400
-
-    if not (isinstance(data["observed_at"], str) and validate_iso8601_with_tz(data["observed_at"])):
-        return jsonify({"error": "Invalid observed_at must be ISO8601 with timezone", "field": "observed_at"}), 400
-
-    if data["type"] not in ["status", "anomaly", "test"]:
-        return jsonify({"error": "Invalid type", "field": "type"}), 400
-
-    if "note" in data:
-        if not isinstance(data["note"], str) or len(data["note"]) > 200:
-            return jsonify({"error": "Invalid note", "field": "note"}), 400
-
-    # 4. 重複檢查 (409)
-    if data["event_id"] in events_store:
-        return jsonify({"error": "Conflict: event_id already exists", "field": "event_id"}), 409
-
-    # 5. 建立 (201)
-    record = dict(data)
-    record["received_at"] = datetime.now(timezone.utc).isoformat()
-    events_store[data["event_id"]] = record
-
-    return jsonify(record), 201
-
-@app.route("/events", methods=["GET"])
-def get_events():
-    rep_token, op_token = get_tokens()
-    token = get_bearer_token()
-
-    if not token or (token != rep_token and token != op_token):
-        return jsonify({"error": "Unauthorized"}), 401
-    if token != op_token:
-        return jsonify({"error": "Forbidden"}), 403
-
-    items = list(events_store.values())[-50:]
-    return jsonify(items), 200
-
-@app.route("/events/<event_id>", methods=["GET"])
-def get_event_by_id(event_id):
-    rep_token, op_token = get_tokens()
-    token = get_bearer_token()
-
-    if not token or (token != rep_token and token != op_token):
-        return jsonify({"error": "Unauthorized"}), 401
-    if token != op_token:
-        return jsonify({"error": "Forbidden"}), 403
-
-    if event_id not in events_store:
-        return jsonify({"error": "Not Found"}), 404
-    return jsonify(events_store[event_id]), 200
-
-INDEX_HTML = """
-<!DOCTYPE html>
+INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Inspection Events</title></head>
 <body>
@@ -162,12 +51,163 @@ INDEX_HTML = """
     });
   </script>
 </body>
-</html>
-"""
+</html>"""
 
-@app.route("/", methods=["GET"])
-def index():
-    return render_template_string(INDEX_HTML), 200
+class InspectionHandler(BaseHTTPRequestHandler):
+    def send_json(self, status_code, data):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def get_bearer_token(self):
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            return auth[7:].strip()
+        return None
+
+    def do_GET(self):
+        rep_token, op_token = get_tokens()
+
+        if self.path == "/health":
+            auth_configured = bool(rep_token and op_token)
+            version = os.environ.get("APP_VERSION", "unknown")
+            self.send_json(200, {
+                "status": "ok",
+                "service": "inspection",
+                "version": version,
+                "auth_configured": auth_configured
+            })
+            return
+
+        if self.path == "/":
+            body = INDEX_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path == "/events":
+            token = self.get_bearer_token()
+            if not token or (token != rep_token and token != op_token):
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            if token != op_token:
+                self.send_json(403, {"error": "Forbidden"})
+                return
+
+            items = list(events_store.values())[-50:]
+            self.send_json(200, items)
+            return
+
+        if self.path.startswith("/events/"):
+            token = self.get_bearer_token()
+            if not token or (token != rep_token and token != op_token):
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            if token != op_token:
+                self.send_json(403, {"error": "Forbidden"})
+                return
+
+            event_id = self.path[len("/events/"):]
+            if event_id not in events_store:
+                self.send_json(404, {"error": "Not Found"})
+                return
+            self.send_json(200, events_store[event_id])
+            return
+
+        self.send_json(404, {"error": "Not Found"})
+
+    def do_POST(self):
+        rep_token, op_token = get_tokens()
+
+        if self.path == "/events":
+            token = self.get_bearer_token()
+            # 1. 認證 (401)
+            if not token or (token != rep_token and token != op_token):
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+            # 2. 授權 (403)
+            if token != rep_token:
+                self.send_json(403, {"error": "Forbidden"})
+                return
+
+            # 3. 大小與 Content-Type (400)
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 4096:
+                self.send_json(400, {"error": "Payload too large", "field": "body"})
+                return
+
+            content_type = self.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                self.send_json(400, {"error": "Content-Type must be application/json", "field": "Content-Type"})
+                return
+
+            raw_body = self.rfile.read(length)
+            try:
+                data = json.loads(raw_body.decode("utf-8"))
+            except Exception:
+                self.send_json(400, {"error": "Invalid JSON body", "field": "body"})
+                return
+
+            if not isinstance(data, dict):
+                self.send_json(400, {"error": "Invalid JSON body", "field": "body"})
+                return
+
+            allowed_keys = {"event_id", "device_id", "observed_at", "type", "note"}
+            if not set(data.keys()).issubset(allowed_keys):
+                extra = list(set(data.keys()) - allowed_keys)[0]
+                self.send_json(400, {"error": "Extra field not allowed", "field": extra})
+                return
+
+            for req_field in ["event_id", "device_id", "observed_at", "type"]:
+                if req_field not in data:
+                    self.send_json(400, {"error": "Missing required field", "field": req_field})
+                    return
+
+            if not (isinstance(data["event_id"], str) and 1 <= len(data["event_id"]) <= 64 and re.fullmatch(r"[A-Za-z0-9_-]+", data["event_id"])):
+                self.send_json(400, {"error": "Invalid event_id", "field": "event_id"})
+                return
+
+            if not (isinstance(data["device_id"], str) and 1 <= len(data["device_id"]) <= 32 and re.fullmatch(r"[A-Za-z0-9_-]+", data["device_id"])):
+                self.send_json(400, {"error": "Invalid device_id", "field": "device_id"})
+                return
+
+            if not (isinstance(data["observed_at"], str) and validate_iso8601_with_tz(data["observed_at"])):
+                self.send_json(400, {"error": "Invalid observed_at must be ISO8601 with timezone", "field": "observed_at"})
+                return
+
+            if data["type"] not in ["status", "anomaly", "test"]:
+                self.send_json(400, {"error": "Invalid type", "field": "type"})
+                return
+
+            if "note" in data:
+                if not isinstance(data["note"], str) or len(data["note"]) > 200:
+                    self.send_json(400, {"error": "Invalid note", "field": "note"})
+                    return
+
+            # 4. 重複 (409)
+            if data["event_id"] in events_store:
+                self.send_json(409, {"error": "Conflict: event_id already exists", "field": "event_id"})
+                return
+
+            # 5. 建立 (201)
+            record = dict(data)
+            record["received_at"] = datetime.now(timezone.utc).isoformat()
+            events_store[data["event_id"]] = record
+            self.send_json(201, record)
+            return
+
+        self.send_json(404, {"error": "Not Found"})
+
+def run_server():
+    server_address = ("127.0.0.1", 8080)
+    httpd = HTTPServer(server_address, InspectionHandler)
+    httpd.serve_forever()
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8080)
+    run_server()
