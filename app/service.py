@@ -5,12 +5,17 @@ from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# 讀取環境變數中的權杖
+# 讀取環境變數
 REPORTER_TOKEN = os.environ.get("REPORTER_TOKEN", "")
 OPERATOR_TOKEN = os.environ.get("OPERATOR_TOKEN", "")
 
 # 記憶體存儲
 events_store = {}
+
+def get_tokens():
+    rep = os.environ.get("REPORTER_TOKEN", REPORTER_TOKEN)
+    op = os.environ.get("OPERATOR_TOKEN", OPERATOR_TOKEN)
+    return rep, op
 
 def get_bearer_token():
     auth = request.headers.get("Authorization", "")
@@ -28,26 +33,28 @@ def validate_iso8601_with_tz(date_str):
 @app.route("/health", methods=["GET"])
 def health():
     version = os.environ.get("APP_VERSION", "unknown")
-    # 動態取得當前最新設定的 token 狀態
-    cur_rep = os.environ.get("REPORTER_TOKEN", REPORTER_TOKEN)
-    cur_op = os.environ.get("OPERATOR_TOKEN", OPERATOR_TOKEN)
-    auth_configured = bool(cur_rep and cur_op)
-    return jsonify({"status": "ok", "version": version, "auth_configured": auth_configured}), 200
+    rep, op = get_tokens()
+    auth_configured = bool(rep and op)
+    return jsonify({
+        "status": "ok",
+        "service": "inspection",
+        "version": version,
+        "auth_configured": auth_configured
+    }), 200
 
 @app.route("/events", methods=["POST"])
 def post_event():
-    cur_rep = os.environ.get("REPORTER_TOKEN", REPORTER_TOKEN)
-    cur_op = os.environ.get("OPERATOR_TOKEN", OPERATOR_TOKEN)
+    rep_token, op_token = get_tokens()
     token = get_bearer_token()
 
     # 1. 認證優先 (401)
-    if not token or (token != cur_rep and token != cur_op):
+    if not token or (token != rep_token and token != op_token):
         return jsonify({"error": "Unauthorized"}), 401
     # 2. 授權 (403)
-    if token != cur_rep:
+    if token != rep_token:
         return jsonify({"error": "Forbidden"}), 403
 
-    # 3. 請求大小與 Content-Type 驗證 (400)
+    # 3. 請求大小與格式驗證 (400)
     if request.content_length and request.content_length > 4096:
         return jsonify({"error": "Payload too large", "field": "body"}), 400
     if not request.is_json:
@@ -86,7 +93,7 @@ def post_event():
     if data["event_id"] in events_store:
         return jsonify({"error": "Conflict: event_id already exists", "field": "event_id"}), 409
 
-    # 5. 建立成功 (201)
+    # 5. 建立 (201)
     record = dict(data)
     record["received_at"] = datetime.now(timezone.utc).isoformat()
     events_store[data["event_id"]] = record
@@ -95,13 +102,12 @@ def post_event():
 
 @app.route("/events", methods=["GET"])
 def get_events():
-    cur_rep = os.environ.get("REPORTER_TOKEN", REPORTER_TOKEN)
-    cur_op = os.environ.get("OPERATOR_TOKEN", OPERATOR_TOKEN)
+    rep_token, op_token = get_tokens()
     token = get_bearer_token()
 
-    if not token or (token != cur_rep and token != cur_op):
+    if not token or (token != rep_token and token != op_token):
         return jsonify({"error": "Unauthorized"}), 401
-    if token != cur_op:
+    if token != op_token:
         return jsonify({"error": "Forbidden"}), 403
 
     items = list(events_store.values())[-50:]
@@ -109,13 +115,12 @@ def get_events():
 
 @app.route("/events/<event_id>", methods=["GET"])
 def get_event_by_id(event_id):
-    cur_rep = os.environ.get("REPORTER_TOKEN", REPORTER_TOKEN)
-    cur_op = os.environ.get("OPERATOR_TOKEN", OPERATOR_TOKEN)
+    rep_token, op_token = get_tokens()
     token = get_bearer_token()
 
-    if not token or (token != cur_rep and token != cur_op):
+    if not token or (token != rep_token and token != op_token):
         return jsonify({"error": "Unauthorized"}), 401
-    if token != cur_op:
+    if token != op_token:
         return jsonify({"error": "Forbidden"}), 403
 
     if event_id not in events_store:
