@@ -32,6 +32,7 @@ set -euo pipefail
 dnf install -y nginx python3
 id inspection >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin inspection
 install -d -m 755 /opt/inspection
+install -d -o root -g root -m 700 /etc/inspection
 base64 --decode <<'W3_ARCHIVE' | tar -xz -C /opt/inspection
 PAYLOAD
 W3_ARCHIVE
@@ -45,6 +46,7 @@ Type=simple
 User=inspection
 WorkingDirectory=/opt/inspection/app
 ExecStart=/usr/bin/python3 /opt/inspection/app/service.py
+EnvironmentFile=-/etc/inspection/app.env
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
