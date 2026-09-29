@@ -27,9 +27,9 @@ if [ "$CONFIRM" != "yes" ]; then
   exit 0
 fi
 
-# 1. 產生安裝腳本
+# 1. 產生安裝腳本 (傳入 commit 與 output 檔案路徑)
 USER_DATA_FILE=$(mktemp)
-python3 deploy/make_user_data.py > "$USER_DATA_FILE"
+python3 deploy/make_user_data.py "$COMMIT_ID" "$USER_DATA_FILE"
 
 # 2. 經 SSH 傳送並執行安裝腳本
 echo "正在遠端執行安裝更新..."
