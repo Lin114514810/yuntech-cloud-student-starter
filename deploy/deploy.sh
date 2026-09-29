@@ -27,8 +27,8 @@ if [ "$CONFIRM" != "yes" ]; then
   exit 0
 fi
 
-# 1. 產生安裝腳本 (傳入 commit 與 output 檔案路徑)
-USER_DATA_FILE=$(mktemp)
+# 1. 產生安裝腳本 (用 -u 避免預先建立檔案引發 FileExistsError)
+USER_DATA_FILE=$(mktemp -u)
 python3 deploy/make_user_data.py "$COMMIT_ID" "$USER_DATA_FILE"
 
 # 2. 經 SSH 傳送並執行安裝腳本
