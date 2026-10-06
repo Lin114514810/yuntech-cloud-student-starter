@@ -46,7 +46,7 @@ rm -f "$USER_DATA_FILE"
 
 # 3. 經 SSH stdin 傳送 app.env 到 /etc/inspection/app.env 並重啟服務
 echo "正在傳送設定檔並重啟服務..."
-cat .local/app.env .local/db.env | ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "${SSH_USER}@${TARGET_HOST}" "sudo mkdir -p /etc/inspection && sudo tee /etc/inspection/app.env > /dev/null && sudo chmod 600 /etc/inspection/app.env && sudo chown root:root /etc/inspection/app.env && sudo systemctl restart inspection"
+cat .local/app.env .local/db.env | ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "${SSH_USER}@${TARGET_HOST}" "sudo mkdir -p /etc/inspection /etc/systemd/system/inspection.service.d && printf '%s\n' '[Service]' 'Environment=HOME=/tmp' | sudo tee /etc/systemd/system/inspection.service.d/10-rds-home.conf > /dev/null && sudo tee /etc/inspection/app.env > /dev/null && sudo chmod 600 /etc/inspection/app.env && sudo chown root:root /etc/inspection/app.env && sudo systemctl daemon-reload && sudo systemctl restart inspection"
 
 # 4. 健康檢查
 echo "驗證服務狀態..."

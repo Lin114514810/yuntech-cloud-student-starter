@@ -56,6 +56,7 @@ ExecStart=/opt/inspection/venv/bin/python /opt/inspection/app/service.py
 EnvironmentFile=-/etc/inspection/app.env
 Environment=PSYCOPG_IMPL=binary
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/tmp
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
