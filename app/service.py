@@ -2,21 +2,12 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import unquote
 
-# 記憶體存儲
-events_store = {}
-
-def get_tokens():
-    return os.environ.get("REPORTER_TOKEN", ""), os.environ.get("OPERATOR_TOKEN", "")
-
-def validate_iso8601_with_tz(date_str):
-    try:
-        dt = datetime.fromisoformat(date_str)
-        return dt.tzinfo is not None
-    except Exception:
-        return False
-
+RDS_CA_FILE = "/etc/inspection/rds-ca.pem"
+_STARTED_AT = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Inspection Events</title></head>
@@ -53,7 +44,193 @@ INDEX_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
+
+class DatabaseUnavailable(Exception):
+    pass
+
+
+def get_tokens():
+    return os.environ.get("REPORTER_TOKEN", ""), os.environ.get("OPERATOR_TOKEN", "")
+
+
+def validate_iso8601_with_tz(date_str):
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return dt.tzinfo is not None
+    except (TypeError, ValueError):
+        return False
+
+
+def database_configured():
+    return all(os.environ.get(key) for key in ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"))
+
+
+def connect_database():
+    if not database_configured():
+        raise DatabaseUnavailable("not_configured")
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise DatabaseUnavailable("driver_unavailable") from exc
+
+    try:
+        return psycopg.connect(
+            host=os.environ["DB_HOST"],
+            dbname=os.environ["DB_NAME"],
+            user=os.environ["DB_USER"],
+            password=os.environ["DB_PASSWORD"],
+            sslmode="verify-full",
+            sslrootcert=RDS_CA_FILE,
+            connect_timeout=5,
+        )
+    except psycopg.Error as exc:
+        raise DatabaseUnavailable(type(exc).__name__) from exc
+
+
+def ensure_events_table(cursor):
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL,
+            type TEXT NOT NULL,
+            note TEXT,
+            received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def _record(row):
+    if row is None:
+        return None
+    observed_at = row[2]
+    received_at = row[5]
+    result = {
+        "event_id": row[0],
+        "device_id": row[1],
+        "observed_at": observed_at.isoformat() if hasattr(observed_at, "isoformat") else observed_at,
+        "type": row[3],
+        "received_at": received_at.isoformat() if hasattr(received_at, "isoformat") else received_at,
+    }
+    if row[4] is not None:
+        result["note"] = row[4]
+    return result
+
+
+def _normalized_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def insert_event(data):
+    connection = connect_database()
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                ensure_events_table(cursor)
+                cursor.execute(
+                    """
+                    INSERT INTO events (event_id, device_id, observed_at, type, note)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (event_id) DO NOTHING
+                    RETURNING event_id, device_id, observed_at, type, note, received_at
+                    """,
+                    (
+                        data["event_id"],
+                        data["device_id"],
+                        data["observed_at"],
+                        data["type"],
+                        data.get("note"),
+                    ),
+                )
+                inserted = cursor.fetchone()
+                if inserted is not None:
+                    return "created", _record(inserted)
+
+                cursor.execute(
+                    """
+                    SELECT event_id, device_id, observed_at, type, note, received_at
+                    FROM events WHERE event_id = %s
+                    """,
+                    (data["event_id"],),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    raise DatabaseUnavailable("conflict_row_missing")
+
+                same_content = (
+                    existing[1] == data["device_id"]
+                    and _normalized_time(data["observed_at"]) == existing[2].astimezone(timezone.utc)
+                    and existing[3] == data["type"]
+                    and existing[4] == data.get("note")
+                )
+                return ("duplicate" if same_content else "conflict"), _record(existing)
+    except DatabaseUnavailable:
+        raise
+    except Exception as exc:
+        raise DatabaseUnavailable(type(exc).__name__) from exc
+    finally:
+        connection.close()
+
+
+def list_events():
+    connection = connect_database()
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                ensure_events_table(cursor)
+                cursor.execute(
+                    """
+                    SELECT event_id, device_id, observed_at, type, note, received_at
+                    FROM events ORDER BY received_at DESC LIMIT 50
+                    """
+                )
+                return [_record(row) for row in cursor.fetchall()][::-1]
+    except DatabaseUnavailable:
+        raise
+    except Exception as exc:
+        raise DatabaseUnavailable(type(exc).__name__) from exc
+    finally:
+        connection.close()
+
+
+def get_event(event_id):
+    connection = connect_database()
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                ensure_events_table(cursor)
+                cursor.execute(
+                    """
+                    SELECT event_id, device_id, observed_at, type, note, received_at
+                    FROM events WHERE event_id = %s
+                    """,
+                    (event_id,),
+                )
+                return _record(cursor.fetchone())
+    except DatabaseUnavailable:
+        raise
+    except Exception as exc:
+        raise DatabaseUnavailable(type(exc).__name__) from exc
+    finally:
+        connection.close()
+
+
+def load_version(version_file):
+    version_path = Path(version_file)
+    if version_path.exists():
+        version = version_path.read_text(encoding="utf-8").strip()
+    else:
+        version = os.environ.get("APP_VERSION", "unknown")
+    if version != "unknown" and not re.fullmatch(r"[0-9a-f]{40}", version):
+        raise ValueError("Invalid deployment version")
+    return version
+
+
 class InspectionHandler(BaseHTTPRequestHandler):
+    server_version = "Inspection/1"
+
     def send_json(self, status_code, data):
         body = json.dumps(data).encode("utf-8")
         self.send_response(status_code)
@@ -68,18 +245,35 @@ class InspectionHandler(BaseHTTPRequestHandler):
             return auth[7:].strip()
         return None
 
+    def require_operator(self, reporter_token, operator_token):
+        token = self.get_bearer_token()
+        if not token or (token != reporter_token and token != operator_token):
+            self.send_json(401, {"error": "Unauthorized"})
+            return False
+        if token != operator_token:
+            self.send_json(403, {"error": "Forbidden"})
+            return False
+        return True
+
+    def report_database_error(self, exc):
+        self.log_error("database unavailable (%s)", str(exc))
+        self.send_json(503, {"error": "Database unavailable"})
+
     def do_GET(self):
-        rep_token, op_token = get_tokens()
+        reporter_token, operator_token = get_tokens()
 
         if self.path == "/health":
-            auth_configured = bool(rep_token and op_token)
-            version = os.environ.get("APP_VERSION", "unknown")
-            self.send_json(200, {
-                "status": "ok",
-                "service": "inspection",
-                "version": version,
-                "auth_configured": auth_configured
-            })
+            self.send_json(
+                200,
+                {
+                    "status": "ok",
+                    "service": "inspection",
+                    "version": self.server.version,
+                    "started_at": self.server.started_at,
+                    "auth_configured": bool(reporter_token and operator_token),
+                    "db_configured": database_configured(),
+                },
+            )
             return
 
         if self.path == "/":
@@ -92,122 +286,122 @@ class InspectionHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/events":
-            token = self.get_bearer_token()
-            if not token or (token != rep_token and token != op_token):
-                self.send_json(401, {"error": "Unauthorized"})
+            if not self.require_operator(reporter_token, operator_token):
                 return
-            if token != op_token:
-                self.send_json(403, {"error": "Forbidden"})
-                return
-
-            items = list(events_store.values())[-50:]
-            self.send_json(200, items)
+            try:
+                self.send_json(200, list_events())
+            except DatabaseUnavailable as exc:
+                self.report_database_error(exc)
             return
 
         if self.path.startswith("/events/"):
-            token = self.get_bearer_token()
-            if not token or (token != rep_token and token != op_token):
-                self.send_json(401, {"error": "Unauthorized"})
+            if not self.require_operator(reporter_token, operator_token):
                 return
-            if token != op_token:
-                self.send_json(403, {"error": "Forbidden"})
+            event_id = unquote(self.path[len("/events/"):])
+            try:
+                result = get_event(event_id)
+            except DatabaseUnavailable as exc:
+                self.report_database_error(exc)
                 return
-
-            event_id = self.path[len("/events/"):]
-            if event_id not in events_store:
+            if result is None:
                 self.send_json(404, {"error": "Not Found"})
-                return
-            self.send_json(200, events_store[event_id])
+            else:
+                self.send_json(200, result)
             return
 
         self.send_json(404, {"error": "Not Found"})
 
     def do_POST(self):
-        rep_token, op_token = get_tokens()
+        reporter_token, operator_token = get_tokens()
 
-        if self.path == "/events":
-            token = self.get_bearer_token()
-            # 1. 認證 (401)
-            if not token or (token != rep_token and token != op_token):
-                self.send_json(401, {"error": "Unauthorized"})
-                return
-            # 2. 授權 (403)
-            if token != rep_token:
-                self.send_json(403, {"error": "Forbidden"})
-                return
-
-            # 3. 大小與 Content-Type (400)
-            length = int(self.headers.get("Content-Length", 0))
-            if length > 4096:
-                self.send_json(400, {"error": "Payload too large", "field": "body"})
-                return
-
-            content_type = self.headers.get("Content-Type", "")
-            if "application/json" not in content_type:
-                self.send_json(400, {"error": "Content-Type must be application/json", "field": "Content-Type"})
-                return
-
-            raw_body = self.rfile.read(length)
-            try:
-                data = json.loads(raw_body.decode("utf-8"))
-            except Exception:
-                self.send_json(400, {"error": "Invalid JSON body", "field": "body"})
-                return
-
-            if not isinstance(data, dict):
-                self.send_json(400, {"error": "Invalid JSON body", "field": "body"})
-                return
-
-            allowed_keys = {"event_id", "device_id", "observed_at", "type", "note"}
-            if not set(data.keys()).issubset(allowed_keys):
-                extra = list(set(data.keys()) - allowed_keys)[0]
-                self.send_json(400, {"error": "Extra field not allowed", "field": extra})
-                return
-
-            for req_field in ["event_id", "device_id", "observed_at", "type"]:
-                if req_field not in data:
-                    self.send_json(400, {"error": "Missing required field", "field": req_field})
-                    return
-
-            if not (isinstance(data["event_id"], str) and 1 <= len(data["event_id"]) <= 64 and re.fullmatch(r"[A-Za-z0-9_-]+", data["event_id"])):
-                self.send_json(400, {"error": "Invalid event_id", "field": "event_id"})
-                return
-
-            if not (isinstance(data["device_id"], str) and 1 <= len(data["device_id"]) <= 32 and re.fullmatch(r"[A-Za-z0-9_-]+", data["device_id"])):
-                self.send_json(400, {"error": "Invalid device_id", "field": "device_id"})
-                return
-
-            if not (isinstance(data["observed_at"], str) and validate_iso8601_with_tz(data["observed_at"])):
-                self.send_json(400, {"error": "Invalid observed_at must be ISO8601 with timezone", "field": "observed_at"})
-                return
-
-            if data["type"] not in ["status", "anomaly", "test"]:
-                self.send_json(400, {"error": "Invalid type", "field": "type"})
-                return
-
-            if "note" in data:
-                if not isinstance(data["note"], str) or len(data["note"]) > 200:
-                    self.send_json(400, {"error": "Invalid note", "field": "note"})
-                    return
-
-            # 4. 重複 (409)
-            if data["event_id"] in events_store:
-                self.send_json(409, {"error": "Conflict: event_id already exists", "field": "event_id"})
-                return
-
-            # 5. 建立 (201)
-            record = dict(data)
-            record["received_at"] = datetime.now(timezone.utc).isoformat()
-            events_store[data["event_id"]] = record
-            self.send_json(201, record)
+        if self.path != "/events":
+            self.send_json(404, {"error": "Not Found"})
             return
 
-        self.send_json(404, {"error": "Not Found"})
+        token = self.get_bearer_token()
+        if not token or (token != reporter_token and token != operator_token):
+            self.send_json(401, {"error": "Unauthorized"})
+            return
+        if token != reporter_token:
+            self.send_json(403, {"error": "Forbidden"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self.send_json(400, {"error": "Invalid Content-Length", "field": "body"})
+            return
+        if length < 0 or length > 4096:
+            self.send_json(400, {"error": "Payload too large", "field": "body"})
+            return
+
+        if "application/json" not in self.headers.get("Content-Type", ""):
+            self.send_json(400, {"error": "Content-Type must be application/json", "field": "Content-Type"})
+            return
+
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json(400, {"error": "Invalid JSON body", "field": "body"})
+            return
+        if not isinstance(data, dict):
+            self.send_json(400, {"error": "Invalid JSON body", "field": "body"})
+            return
+
+        allowed_keys = {"event_id", "device_id", "observed_at", "type", "note"}
+        extra_keys = set(data) - allowed_keys
+        if extra_keys:
+            self.send_json(400, {"error": "Extra field not allowed", "field": sorted(extra_keys)[0]})
+            return
+        for required in ("event_id", "device_id", "observed_at", "type"):
+            if required not in data:
+                self.send_json(400, {"error": "Missing required field", "field": required})
+                return
+
+        if not isinstance(data["event_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", data["event_id"]):
+            self.send_json(400, {"error": "Invalid event_id", "field": "event_id"})
+            return
+        if not isinstance(data["device_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", data["device_id"]):
+            self.send_json(400, {"error": "Invalid device_id", "field": "device_id"})
+            return
+        if not isinstance(data["observed_at"], str) or not validate_iso8601_with_tz(data["observed_at"]):
+            self.send_json(400, {"error": "Invalid observed_at must be ISO8601 with timezone", "field": "observed_at"})
+            return
+        if data["type"] not in ("status", "anomaly", "test"):
+            self.send_json(400, {"error": "Invalid type", "field": "type"})
+            return
+        if "note" in data and (not isinstance(data["note"], str) or len(data["note"]) > 200):
+            self.send_json(400, {"error": "Invalid note", "field": "note"})
+            return
+
+        try:
+            outcome, record = insert_event(data)
+        except DatabaseUnavailable as exc:
+            self.report_database_error(exc)
+            return
+
+        if outcome == "created":
+            self.send_json(201, record)
+        elif outcome == "duplicate":
+            self.send_json(200, record)
+        else:
+            self.send_json(409, {"error": "Conflict: event_id already exists", "field": "event_id"})
+
+    def log_message(self, format, *args):
+        super().log_message(format, *args)
+
+
+def make_server(version_file="/opt/inspection/app/version", host="127.0.0.1", port=8080):
+    server = HTTPServer((host, port), InspectionHandler)
+    server.version = load_version(version_file)
+    server.started_at = _STARTED_AT
+    return server
+
 
 def run_server():
-    server_address = ("127.0.0.1", 8080)
-    httpd = HTTPServer(server_address, InspectionHandler)
-    httpd.serve_forever()
+    server = make_server()
+    server.serve_forever()
+
 
 if __name__ == "__main__":
     run_server()

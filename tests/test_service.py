@@ -1,76 +1,99 @@
 import json
-import pytest
-from app.service import app, events_store
+from pathlib import Path
+import threading
+import unittest
+from unittest.mock import patch
+import urllib.error
+import urllib.request
 
-@pytest.fixture(autouse=True)
-def setup_env_and_store(monkeypatch):
-    events_store.clear()
-    monkeypatch.setenv("REPORTER_TOKEN", "test-reporter-secret")
-    monkeypatch.setenv("OPERATOR_TOKEN", "test-operator-secret")
+from app import service
 
-@pytest.fixture
-def client():
-    app.config["TESTING"] = True
-    with app.test_client() as client:
-        yield client
+ROOT = Path(__file__).resolve().parents[1]
 
-def test_auth_sequence_unauthorized_first(client):
-    # 規則：未認證者送錯格式，必須先拿 401 而非 400
-    res = client.post("/events", json={"bad": "payload"})
-    assert res.status_code == 401
 
-def test_fixtures_validation(client):
-    # 1. 成功測資
-    with open("tests/fixtures/valid_event.json") as f:
-        valid_data = json.load(f)
-    res = client.post(
-        "/events",
-        json=valid_data,
-        headers={"Authorization": "Bearer test-reporter-secret"}
-    )
-    assert res.status_code == 201
-    assert "received_at" in res.get_json()
+class ServiceContractTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(
+            "os.environ",
+            {
+                "REPORTER_TOKEN": "test-reporter",
+                "OPERATOR_TOKEN": "test-operator",
+            },
+            clear=True,
+        )
+        self.env.start()
+        self.server = service.make_server(version_file="/not-present", port=0)
+        self.worker = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.worker.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
 
-    # 409 重複送出
-    res_duplicate = client.post(
-        "/events",
-        json=valid_data,
-        headers={"Authorization": "Bearer test-reporter-secret"}
-    )
-    assert res_duplicate.status_code == 409
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.worker.join(timeout=2)
+        self.env.stop()
 
-    # 2. 拒絕測資：無時區
-    with open("tests/fixtures/invalid_no_tz.json") as f:
-        invalid_tz = json.load(f)
-    res_tz = client.post(
-        "/events",
-        json=invalid_tz,
-        headers={"Authorization": "Bearer test-reporter-secret"}
-    )
-    assert res_tz.status_code == 400
-    assert res_tz.get_json().get("field") == "observed_at"
+    def call(self, path, method="GET", body=None, token=None):
+        headers = {}
+        encoded = None
+        if body is not None:
+            encoded = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(
+            self.base + path, data=encoded, headers=headers, method=method
+        )
+        try:
+            response = urllib.request.urlopen(request)
+        except urllib.error.HTTPError as exc:
+            response = exc
+        return response.status, json.loads(response.read().decode("utf-8"))
 
-    # 3. 拒絕測資：多餘欄位
-    with open("tests/fixtures/invalid_extra_field.json") as f:
-        extra_field = json.load(f)
-    res_extra = client.post(
-        "/events",
-        json=extra_field,
-        headers={"Authorization": "Bearer test-reporter-secret"}
-    )
-    assert res_extra.status_code == 400
+    def test_unauthorized_request_is_rejected_before_payload_validation(self):
+        status, _ = self.call("/events", "POST", {"bad": "payload"})
+        self.assertEqual(status, 401)
 
-def test_operator_permissions(client):
-    # 準備一筆資料
-    with open("tests/fixtures/valid_event.json") as f:
-        valid_data = json.load(f)
-    client.post("/events", json=valid_data, headers={"Authorization": "Bearer test-reporter-secret"})
+    def test_home_page_remains_available(self):
+        request = urllib.request.Request(self.base + "/")
+        with urllib.request.urlopen(request) as response:
+            body = response.read().decode("utf-8")
+        self.assertEqual(response.status, 200)
+        self.assertIn("Inspection Events", body)
 
-    # reporter 不能讀取清單 (403)
-    res_rep_get = client.get("/events", headers={"Authorization": "Bearer test-reporter-secret"})
-    assert res_rep_get.status_code == 403
+    def test_event_validation_and_idempotent_duplicate(self):
+        valid_data = json.loads((ROOT / "tests/fixtures/valid_event.json").read_text())
+        with patch.object(
+            service,
+            "insert_event",
+            side_effect=[
+                ("created", dict(valid_data, received_at="2026-10-06T01:00:00+00:00")),
+                ("duplicate", dict(valid_data, received_at="2026-10-06T01:00:00+00:00")),
+            ],
+        ):
+            status, response = self.call(
+                "/events", "POST", valid_data, "test-reporter"
+            )
+            self.assertEqual(status, 201)
+            self.assertIn("received_at", response)
 
-    # operator 可以讀取清單 (200)
-    res_op_get = client.get("/events", headers={"Authorization": "Bearer test-operator-secret"})
-    assert res_op_get.status_code == 200
-    assert len(res_op_get.get_json()) == 1
+            status, _ = self.call("/events", "POST", valid_data, "test-reporter")
+            self.assertEqual(status, 200)
+
+        invalid_tz = json.loads((ROOT / "tests/fixtures/invalid_no_tz.json").read_text())
+        status, response = self.call("/events", "POST", invalid_tz, "test-reporter")
+        self.assertEqual(status, 400)
+        self.assertEqual(response["field"], "observed_at")
+
+        extra_field = json.loads((ROOT / "tests/fixtures/invalid_extra_field.json").read_text())
+        status, _ = self.call("/events", "POST", extra_field, "test-reporter")
+        self.assertEqual(status, 400)
+
+    def test_operator_read_permissions(self):
+        status, _ = self.call("/events", token="test-reporter")
+        self.assertEqual(status, 403)
+
+        with patch.object(service, "list_events", return_value=[{"event_id": "one"}]):
+            status, items = self.call("/events", token="test-operator")
+        self.assertEqual(status, 200)
+        self.assertEqual(items, [{"event_id": "one"}])

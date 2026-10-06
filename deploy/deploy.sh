@@ -6,6 +6,14 @@ if [ "$(stat -c '%a' .local/app.env 2>/dev/null || true)" != "600" ]; then
   echo "錯誤: .local/app.env 權限必須為 600" >&2
   exit 1
 fi
+if [ "$(stat -c '%a' .local/db.env 2>/dev/null || true)" != "600" ]; then
+  echo "錯誤: .local/db.env 權限必須為 600；請先完成 deploy/db-up.sh" >&2
+  exit 1
+fi
+if ! grep -q '^DB_HOST=.' .local/db.env; then
+  echo "錯誤: .local/db.env 尚未包含資料庫位址；請先完成 deploy/db-up.sh" >&2
+  exit 1
+fi
 
 SSH_KEY="${HOME}/.ssh/w03_key"
 if [ ! -f "$SSH_KEY" ]; then
@@ -38,7 +46,7 @@ rm -f "$USER_DATA_FILE"
 
 # 3. 經 SSH stdin 傳送 app.env 到 /etc/inspection/app.env 並重啟服務
 echo "正在傳送設定檔並重啟服務..."
-ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "${SSH_USER}@${TARGET_HOST}" "sudo mkdir -p /etc/inspection && sudo tee /etc/inspection/app.env > /dev/null && sudo chmod 600 /etc/inspection/app.env && sudo chown root:root /etc/inspection/app.env && sudo systemctl restart inspection" < .local/app.env
+cat .local/app.env .local/db.env | ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "${SSH_USER}@${TARGET_HOST}" "sudo mkdir -p /etc/inspection && sudo tee /etc/inspection/app.env > /dev/null && sudo chmod 600 /etc/inspection/app.env && sudo chown root:root /etc/inspection/app.env && sudo systemctl restart inspection"
 
 # 4. 健康檢查
 echo "驗證服務狀態..."
@@ -46,9 +54,10 @@ sleep 2
 HEALTH_RES=$(curl -s "http://${TARGET_HOST}/health")
 echo "Health Response: ${HEALTH_RES}"
 
-AUTH_OK=$(echo "$HEALTH_RES" | grep -o '"auth_configured":true' || true)
-if [ -n "$AUTH_OK" ]; then
-  echo "✅ 部署成功且 auth_configured 為 true！"
+AUTH_OK=$(echo "$HEALTH_RES" | grep -o '"auth_configured":[ ]*true' || true)
+DB_OK=$(echo "$HEALTH_RES" | grep -o '"db_configured":[ ]*true' || true)
+if [ -n "$AUTH_OK" ] && [ -n "$DB_OK" ]; then
+  echo "✅ 部署成功且 auth_configured、db_configured 均為 true！"
 else
   echo "❌ 部署後驗證未通過，請檢查服務日誌。"
   exit 1
