@@ -135,6 +135,31 @@ class DatabaseIdempotencyTests(unittest.TestCase):
             },
         )
 
+    def test_database_connection_error_records_safe_phase_and_sqlstate(self):
+        class DriverError(Exception):
+            sqlstate = "08001"
+
+        driver = SimpleNamespace(
+            connect=Mock(side_effect=DriverError("synthetic-host synthetic-password")),
+            Error=DriverError,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "DB_HOST": "db.example.invalid",
+                "DB_NAME": "inspection",
+                "DB_USER": "inspection_admin",
+                "DB_PASSWORD": "synthetic-secret",
+            },
+        ), patch.dict(sys.modules, {"psycopg": driver}):
+            with self.assertRaises(service.DatabaseUnavailable) as caught:
+                service.connect_database()
+
+        self.assertEqual(caught.exception.phase, "connect")
+        self.assertEqual(caught.exception.reason, "DriverError")
+        self.assertEqual(caught.exception.sqlstate, "08001")
+        self.assertNotIn("synthetic", str(caught.exception))
+
 
 class HttpContractTests(unittest.TestCase):
     def setUp(self):

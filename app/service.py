@@ -46,7 +46,11 @@ INDEX_HTML = """<!DOCTYPE html>
 
 
 class DatabaseUnavailable(Exception):
-    pass
+    def __init__(self, reason, phase="unknown", sqlstate=None):
+        self.reason = reason
+        self.phase = phase
+        self.sqlstate = sqlstate
+        super().__init__(reason)
 
 
 def get_tokens():
@@ -67,11 +71,11 @@ def database_configured():
 
 def connect_database():
     if not database_configured():
-        raise DatabaseUnavailable("not_configured")
+        raise DatabaseUnavailable("not_configured", phase="configuration")
     try:
         import psycopg
     except ImportError as exc:
-        raise DatabaseUnavailable("driver_unavailable") from exc
+        raise DatabaseUnavailable("driver_unavailable", phase="driver_import") from exc
 
     try:
         return psycopg.connect(
@@ -84,7 +88,11 @@ def connect_database():
             connect_timeout=5,
         )
     except psycopg.Error as exc:
-        raise DatabaseUnavailable(type(exc).__name__) from exc
+        raise DatabaseUnavailable(
+            type(exc).__name__,
+            phase="connect",
+            sqlstate=exc.sqlstate,
+        ) from exc
 
 
 def ensure_events_table(cursor):
@@ -157,7 +165,7 @@ def insert_event(data):
                 )
                 existing = cursor.fetchone()
                 if existing is None:
-                    raise DatabaseUnavailable("conflict_row_missing")
+                    raise DatabaseUnavailable("conflict_row_missing", phase="query")
 
                 same_content = (
                     existing[1] == data["device_id"]
@@ -169,7 +177,11 @@ def insert_event(data):
     except DatabaseUnavailable:
         raise
     except Exception as exc:
-        raise DatabaseUnavailable(type(exc).__name__) from exc
+        raise DatabaseUnavailable(
+            type(exc).__name__,
+            phase="query",
+            sqlstate=getattr(exc, "sqlstate", None),
+        ) from exc
     finally:
         connection.close()
 
@@ -190,7 +202,11 @@ def list_events():
     except DatabaseUnavailable:
         raise
     except Exception as exc:
-        raise DatabaseUnavailable(type(exc).__name__) from exc
+        raise DatabaseUnavailable(
+            type(exc).__name__,
+            phase="query",
+            sqlstate=getattr(exc, "sqlstate", None),
+        ) from exc
     finally:
         connection.close()
 
@@ -212,7 +228,11 @@ def get_event(event_id):
     except DatabaseUnavailable:
         raise
     except Exception as exc:
-        raise DatabaseUnavailable(type(exc).__name__) from exc
+        raise DatabaseUnavailable(
+            type(exc).__name__,
+            phase="query",
+            sqlstate=getattr(exc, "sqlstate", None),
+        ) from exc
     finally:
         connection.close()
 
@@ -256,7 +276,12 @@ class InspectionHandler(BaseHTTPRequestHandler):
         return True
 
     def report_database_error(self, exc):
-        self.log_error("database unavailable (%s)", str(exc))
+        self.log_error(
+            "database unavailable phase=%s type=%s sqlstate=%s",
+            exc.phase,
+            exc.reason,
+            exc.sqlstate or "none",
+        )
         self.send_json(503, {"error": "Database unavailable"})
 
     def do_GET(self):
