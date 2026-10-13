@@ -92,6 +92,18 @@ class DatabaseIdempotencyTests(unittest.TestCase):
         )
         self.assertTrue(connection.closed)
 
+    def test_device_filter_uses_parameterized_newest_first_query(self):
+        cursor = FakeCursor(None)
+        connection = FakeConnection(cursor)
+        with patch.object(service, "connect_database", return_value=connection):
+            result = service.list_events("device-1")
+
+        self.assertEqual(result, [])
+        statement, params = cursor.statements[-1]
+        self.assertIn("WHERE device_id = %s", statement)
+        self.assertIn("ORDER BY received_at DESC LIMIT 50", statement)
+        self.assertEqual(params, ("device-1",))
+
     def test_duplicate_same_payload_is_idempotent_and_changed_payload_conflicts(self):
         cursor = FakeCursor(None, self.row)
         with patch.object(service, "connect_database", return_value=FakeConnection(cursor)):

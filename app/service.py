@@ -4,7 +4,7 @@ import re
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 RDS_CA_FILE = "/etc/inspection/rds-ca.pem"
 _STARTED_AT = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -14,13 +14,16 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
   <h2>Inspection Events</h2>
   <input type="password" id="opToken" placeholder="貼上 OPERATOR 權杖">
+  <input type="text" id="deviceId" placeholder="設備編號">
   <button id="loadBtn">載入事件清單</button>
   <div id="eventsContainer"></div>
 
   <script>
     document.getElementById('loadBtn').addEventListener('click', () => {
       const token = document.getElementById('opToken').value;
-      fetch('/events', {
+      const deviceId = document.getElementById('deviceId').value.trim();
+      const query = deviceId ? '?device_id=' + encodeURIComponent(deviceId) : '';
+      fetch('/events' + query, {
         headers: { 'Authorization': 'Bearer ' + token }
       })
       .then(res => res.json())
@@ -186,12 +189,23 @@ def insert_event(data):
         connection.close()
 
 
-def list_events():
+def list_events(device_id=None):
     connection = connect_database()
     try:
         with connection:
             with connection.cursor() as cursor:
                 ensure_events_table(cursor)
+                if device_id:
+                    cursor.execute(
+                        """
+                        SELECT event_id, device_id, observed_at, type, note, received_at
+                        FROM events WHERE device_id = %s
+                        ORDER BY received_at DESC LIMIT 50
+                        """,
+                        (device_id,),
+                    )
+                    return [_record(row) for row in cursor.fetchall()]
+
                 cursor.execute(
                     """
                     SELECT event_id, device_id, observed_at, type, note, received_at
@@ -286,8 +300,9 @@ class InspectionHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         reporter_token, operator_token = get_tokens()
+        request_path = urlsplit(self.path)
 
-        if self.path == "/health":
+        if request_path.path == "/health" and not request_path.query:
             self.send_json(
                 200,
                 {
@@ -301,7 +316,7 @@ class InspectionHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if self.path == "/":
+        if request_path.path == "/" and not request_path.query:
             body = INDEX_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -310,19 +325,29 @@ class InspectionHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if self.path == "/events":
+        if request_path.path == "/events":
             if not self.require_operator(reporter_token, operator_token):
                 return
+            query = parse_qs(request_path.query, keep_blank_values=True)
+            device_ids = query.get("device_id", [])
+            if len(device_ids) > 1 or (device_ids and not device_ids[0]):
+                self.send_json(400, {"error": "Invalid device_id", "field": "device_id"})
+                return
+            device_id = device_ids[0] if device_ids else None
+            if device_id is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", device_id):
+                self.send_json(400, {"error": "Invalid device_id", "field": "device_id"})
+                return
             try:
-                self.send_json(200, list_events())
+                events = list_events(device_id) if device_id is not None else list_events()
+                self.send_json(200, events)
             except DatabaseUnavailable as exc:
                 self.report_database_error(exc)
             return
 
-        if self.path.startswith("/events/"):
+        if request_path.path.startswith("/events/"):
             if not self.require_operator(reporter_token, operator_token):
                 return
-            event_id = unquote(self.path[len("/events/"):])
+            event_id = unquote(request_path.path[len("/events/"):])
             try:
                 result = get_event(event_id)
             except DatabaseUnavailable as exc:

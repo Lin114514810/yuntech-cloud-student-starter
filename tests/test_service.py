@@ -97,3 +97,21 @@ class ServiceContractTests(unittest.TestCase):
             status, items = self.call("/events", token="test-operator")
         self.assertEqual(status, 200)
         self.assertEqual(items, [{"event_id": "one"}])
+
+    def test_operator_can_filter_events_by_device_id(self):
+        with patch.object(
+            service, "list_events", return_value=[{"event_id": "one"}]
+        ) as list_events:
+            status, items = self.call(
+                "/events?device_id=g03-m2-d01", token="test-operator"
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(items, [{"event_id": "one"}])
+        list_events.assert_called_once_with("g03-m2-d01")
+
+    def test_invalid_device_filter_is_rejected(self):
+        status, response = self.call(
+            "/events?device_id=invalid%20device", token="test-operator"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(response["field"], "device_id")

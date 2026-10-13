@@ -17,6 +17,18 @@ def build(commit):
     files = {}
     for name in ("app/service.py", "deploy/nginx.conf"):
         files[name] = subprocess.check_output(["git", "show", sha + ":" + name], cwd=ROOT)
+    consumer_check = subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}:app/consumer.py"],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    has_consumer = consumer_check.returncode == 0
+    if has_consumer:
+        files["app/consumer.py"] = subprocess.check_output(
+            ["git", "show", sha + ":app/consumer.py"], cwd=ROOT
+        )
     files["app/version"] = (sha + "\n").encode()
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as tf:
@@ -27,14 +39,44 @@ def build(commit):
             info.mtime = 0
             tf.addfile(info, io.BytesIO(data))
     payload = base64.b64encode(gzip.compress(archive.getvalue(), mtime=0)).decode()
+    consumer_unit = """cat > /etc/systemd/system/inspection-consumer.service <<'W6_UNIT'
+[Unit]
+Description=Inspection IoT event consumer
+After=network-online.target inspection.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=inspection
+Group=inspection
+WorkingDirectory=/opt/inspection/app
+ExecStart=/opt/inspection/venv/bin/python /opt/inspection/app/consumer.py
+EnvironmentFile=-/etc/inspection/app.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/tmp
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+[Install]
+WantedBy=multi-user.target
+W6_UNIT
+""" if has_consumer else ""
+    consumer_install = (
+        "/opt/inspection/venv/bin/pip install --disable-pip-version-check "
+        "--no-cache-dir 'paho-mqtt==2.1.0'\n"
+        if has_consumer else ""
+    )
     script = """#!/bin/bash
 set -euo pipefail
 dnf install -y --allowerasing nginx python3 python3-pip postgresql15 curl
 id inspection >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin inspection
 install -d -m 755 /opt/inspection
-install -d -o root -g inspection -m 750 /etc/inspection
+install -d -o root -g inspection -m 755 /etc/inspection
 python3 -m venv /opt/inspection/venv
 /opt/inspection/venv/bin/pip install --disable-pip-version-check --no-cache-dir 'psycopg[binary]'
+CONSUMER_INSTALL
 curl --fail --silent --show-error --location \\
   https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \\
   --output /etc/inspection/rds-ca.pem.tmp
@@ -66,10 +108,16 @@ ProtectHome=true
 [Install]
 WantedBy=multi-user.target
 W3_UNIT
+CONSUMER_UNIT
 systemctl daemon-reload
 nginx -t
 systemctl enable --now inspection nginx
+if [ -f /opt/inspection/app/consumer.py ]; then
+  systemctl enable inspection-consumer
+fi
 """.replace("PAYLOAD", payload)
+    script = script.replace("CONSUMER_UNIT", consumer_unit)
+    script = script.replace("CONSUMER_INSTALL", consumer_install)
     data = script.encode()
     if len(data) >= 16 * 1024:
         raise ValueError("User data exceeds the course limit (<16384 raw bytes)")
